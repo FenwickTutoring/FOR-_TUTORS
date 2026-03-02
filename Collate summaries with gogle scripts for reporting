@@ -1,0 +1,767 @@
+/**
+ * Main function to create monthly summaries for all student folders
+ */
+function createMonthlySummaries() {
+  // Get the previous month
+  const today = new Date();
+  const previousMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+  const year = previousMonth.getFullYear();
+  const month = previousMonth.getMonth(); // 0-based
+  
+  // Format month as string
+  const monthStr = `${year}/${(month + 1).toString().padStart(2, '0')}`;
+  const monthNames = ["January", "February", "March", "April", "May", "June", 
+                      "July", "August", "September", "October", "November", "December"];
+  const monthName = monthNames[month];
+  
+  // Create or get output folder
+  const outputFolderName = `Monthly Summaries - ${monthName} ${year}`;
+  let outputFolder;
+  
+  try {
+    // Try to find existing folder
+    const folderIterator = DriveApp.getFoldersByName(outputFolderName);
+    if (folderIterator.hasNext()) {
+      outputFolder = folderIterator.next();
+      Logger.log(`Using existing folder: ${outputFolderName}`);
+    } else {
+      // Create new folder
+      outputFolder = DriveApp.createFolder(outputFolderName);
+      Logger.log(`Created new folder: ${outputFolderName}`);
+    }
+  } catch (error) {
+    Logger.log(`Error creating/finding output folder: ${error.toString()}`);
+    return;
+  }
+  
+  // Find the main tutoring folders
+  const tutoringFolders = [];
+  
+  try {
+    // Use the parent folder ID for your tutoring sessions folder
+    const parentFolderId = "YOUR_FOLDER_ID_HERE"; // Replace with your folder ID
+    const parentFolder = DriveApp.getFolderById(parentFolderId);
+    const folderIterator = parentFolder.getFolders();
+    
+    while (folderIterator.hasNext()) {
+      const folder = folderIterator.next();
+      tutoringFolders.push({
+        id: folder.getId(),
+        name: folder.getName()
+      });
+    }
+    
+    Logger.log(`Found ${tutoringFolders.length} tutoring folders.`);
+  } catch (error) {
+    Logger.log(`Error finding tutoring folders: ${error.toString()}`);
+    return;
+  }
+  
+  // Check if we found any folders
+  if (tutoringFolders.length === 0) {
+    Logger.log("No tutoring folders found.");
+    return;
+  }
+  
+  Logger.log(`Found ${tutoringFolders.length} tutoring folders. Processing for ${monthName} ${year}...`);
+  
+  // Process each folder
+  const createdDocs = [];
+  for (const folderInfo of tutoringFolders) {
+    try {
+      processSessionFolder(folderInfo, monthStr, monthName, year, outputFolder, createdDocs);
+    } catch (error) {
+      Logger.log(`Error processing folder ${folderInfo.name}: ${error.toString()}`);
+    }
+  }
+  
+  // Create a summary document of all sessions
+  createMasterSummary(createdDocs, monthName, year, outputFolder);
+}
+
+/**
+ * Helper function to extract text content from document elements
+ */
+function extractTextFromElements(elements) {
+  let text = "";
+  if (!elements) return text;
+  
+  for (const element of elements) {
+    if (element.textRun && element.textRun.content) {
+      text += element.textRun.content;
+    }
+  }
+  return text;
+}
+
+/**
+ * Helper function to get all tabs from a document (including child tabs)
+ */
+function getAllTabs(doc) {
+  const allTabs = [];
+  
+  if (!doc.tabs) {
+    return allTabs;
+  }
+  
+  // Iterate over all tabs and recursively add any child tabs
+  for (const tab of doc.tabs) {
+    addCurrentAndChildTabs(tab, allTabs);
+  }
+  
+  return allTabs;
+}
+
+/**
+ * Helper function to recursively add tabs and child tabs to the list
+ */
+function addCurrentAndChildTabs(tab, allTabs) {
+  allTabs.push(tab);
+  
+  if (tab.childTabs) {
+    for (const childTab of tab.childTabs) {
+      addCurrentAndChildTabs(childTab, allTabs);
+    }
+  }
+}
+
+/**
+ * Helper function to extract all content from document using tabs-aware approach
+ */
+function extractDocumentContent(doc) {
+  let allContent = "";
+  let summaryContent = "";
+  let transcriptContent = "";
+  
+  if (!doc) {
+    return { allContent: "", summaryContent: "", transcriptContent: "" };
+  }
+  
+  // Get all tabs in the document
+  const allTabs = getAllTabs(doc);
+  Logger.log(`Found ${allTabs.length} tabs in document`);
+  
+  if (allTabs.length === 0) {
+    // Fallback to legacy document structure if no tabs
+    Logger.log("No tabs found, using legacy document.body structure");
+    return extractLegacyDocumentContent(doc);
+  }
+  
+  // Process each tab
+  for (let i = 0; i < allTabs.length; i++) {
+    const tab = allTabs[i];
+    const tabTitle = tab.tabProperties ? tab.tabProperties.title : `Tab ${i + 1}`;
+    Logger.log(`Processing tab: ${tabTitle}`);
+    
+    if (!tab.documentTab || !tab.documentTab.body || !tab.documentTab.body.content) {
+      Logger.log(`Tab ${tabTitle} has no content`);
+      continue;
+    }
+    
+    const tabContent = extractTabContent(tab.documentTab.body.content, tabTitle);
+    allContent += tabContent.allContent;
+    
+    // Determine content type based on tab title
+    if (tabTitle.toLowerCase().includes('transcript')) {
+      transcriptContent += tabContent.allContent;
+      Logger.log(`Added transcript content from tab: ${tabTitle} (${tabContent.allContent.length} chars)`);
+    } else if (tabTitle.toLowerCase().includes('notes') || tabTitle.toLowerCase().includes('summary') || i === 0) {
+      // First tab or tabs with "notes/summary" in the name likely contain the AI summary
+      summaryContent += tabContent.summaryContent;
+      Logger.log(`Added summary content from tab: ${tabTitle} (${tabContent.summaryContent.length} chars)`);
+    }
+  }
+  
+  Logger.log(`Final extraction - Summary: ${summaryContent.length} chars, Transcript: ${transcriptContent.length} chars, Total: ${allContent.length} chars`);
+  
+  return {
+    allContent: allContent,
+    summaryContent: summaryContent,
+    transcriptContent: transcriptContent
+  };
+}
+
+/**
+ * Helper function to extract content from a single tab
+ */
+function extractTabContent(elements, tabTitle) {
+  let allContent = "";
+  let summaryContent = "";
+  
+  let foundSummary = false;
+  let foundDetails = false;
+  let summaryParagraphs = [];
+  
+  for (const element of elements) {
+    if (element.paragraph && element.paragraph.elements) {
+      const paragraphText = extractTextFromElements(element.paragraph.elements);
+      allContent += paragraphText + "\n";
+      
+      // Clean up the paragraph text for comparison
+      const cleanText = paragraphText.trim();
+      
+      // Check for section headers (only for non-transcript tabs)
+      if (!tabTitle.toLowerCase().includes('transcript')) {
+        if (cleanText === "Summary") {
+          foundSummary = true;
+          foundDetails = false;
+          continue;
+        } else if (cleanText === "Details") {
+          foundSummary = false;
+          foundDetails = true;
+          continue;
+        }
+        
+        // Collect summary content
+        if (foundSummary && !foundDetails && cleanText !== "") {
+          summaryParagraphs.push(cleanText);
+        }
+      }
+    }
+  }
+  
+  summaryContent = summaryParagraphs.join("\n\n");
+  
+  return {
+    allContent: allContent,
+    summaryContent: summaryContent
+  };
+}
+
+/**
+ * Fallback function for documents without tabs (legacy structure)
+ */
+function extractLegacyDocumentContent(doc) {
+  let allContent = "";
+  let summaryContent = "";
+  let transcriptContent = "";
+  
+  if (!doc.body || !doc.body.content) {
+    return { allContent: "", summaryContent: "", transcriptContent: "" };
+  }
+  
+  let foundSummary = false;
+  let foundDetails = false;
+  let foundTranscript = false;
+  let summaryParagraphs = [];
+  let transcriptParagraphs = [];
+  
+  // Process all content in the document
+  for (const element of doc.body.content) {
+    if (element.paragraph && element.paragraph.elements) {
+      const paragraphText = extractTextFromElements(element.paragraph.elements);
+      allContent += paragraphText + "\n";
+      
+      // Clean up the paragraph text for comparison
+      const cleanText = paragraphText.trim();
+      
+      // Check for section headers
+      if (cleanText === "Summary") {
+        foundSummary = true;
+        foundDetails = false;
+        foundTranscript = false;
+        continue;
+      } else if (cleanText === "Details") {
+        foundSummary = false;
+        foundDetails = true;
+        foundTranscript = false;
+        continue;
+      } else if (cleanText === "Transcript" || cleanText.includes("Transcript")) {
+        foundSummary = false;
+        foundDetails = false;
+        foundTranscript = true;
+        continue;
+      }
+      
+      // Collect content based on current section
+      if (foundSummary && !foundDetails && !foundTranscript && cleanText !== "") {
+        summaryParagraphs.push(cleanText);
+      } else if (foundTranscript && cleanText !== "") {
+        transcriptParagraphs.push(paragraphText);
+      }
+      
+      // Also check if this paragraph contains transcript-like content
+      // Update these names to match your own instructor/student names
+      if (paragraphText.includes("Instructor:") || 
+          paragraphText.includes("Student:") || 
+          paragraphText.includes("Transcription ended after")) {
+        transcriptParagraphs.push(paragraphText);
+      }
+    }
+  }
+  
+  summaryContent = summaryParagraphs.join("\n\n");
+  transcriptContent = transcriptParagraphs.join("\n");
+  
+  Logger.log(`Legacy extraction - Summary: ${summaryContent.length} chars, Transcript: ${transcriptContent.length} chars, Total: ${allContent.length} chars`);
+  
+  return {
+    allContent: allContent,
+    summaryContent: summaryContent,
+    transcriptContent: transcriptContent
+  };
+}
+
+/**
+ * Helper function to extract session duration from content
+ * 
+ * CONFIG: If a specific student has a mid-session break, you can adjust for it
+ * by checking the folder name and subtracting the break duration before rounding.
+ */
+
+// Optional: Configure break adjustments for specific students
+// Set BREAK_STUDENT to a student folder name (or part of it) and BREAK_MINUTES to the break length
+const BREAK_STUDENT = null;  // e.g., 'StudentName' or null to disable
+const BREAK_MINUTES = 10;    // Length of break in minutes
+const BREAK_THRESHOLD = 90;  // Only apply if session exceeds this many minutes
+
+function extractSessionDuration(allContent, transcriptContent, folderName) {
+  let sessionDuration = 0;
+  
+  // First, try to find duration in transcript content (most reliable)
+  if (transcriptContent) {
+    const transcriptDurationMatch = transcriptContent.match(/Transcription ended after (\d{1,2}):(\d{2}):(\d{2})/);
+    if (transcriptDurationMatch) {
+      const hours = parseInt(transcriptDurationMatch[1], 10);
+      const minutes = parseInt(transcriptDurationMatch[2], 10);
+      const seconds = parseInt(transcriptDurationMatch[3], 10);
+      
+      let totalMinutes = (hours * 60) + minutes + (seconds >= 30 ? 1 : 0);
+      
+      // Apply student-specific break adjustment if configured
+      if (BREAK_STUDENT && folderName && folderName.toLowerCase().includes(BREAK_STUDENT.toLowerCase()) && totalMinutes > BREAK_THRESHOLD) {
+        Logger.log(`Break adjustment for ${BREAK_STUDENT}: ${totalMinutes} minutes before adjustment`);
+        totalMinutes -= BREAK_MINUTES;
+        Logger.log(`Applied ${BREAK_MINUTES}-minute break adjustment: ${totalMinutes} minutes`);
+      }
+      
+      sessionDuration = Math.round(totalMinutes / 15) * 15;
+      Logger.log(`Found duration in transcript: ${hours}:${minutes}:${seconds} -> ${totalMinutes} minutes -> ${sessionDuration} minutes (rounded)`);
+      return sessionDuration;
+    }
+  }
+  
+  // Fallback: search in all content
+  const durationMatch = allContent.match(/Transcription ended after (\d{1,2}):(\d{2}):(\d{2})/);
+  if (durationMatch) {
+    const hours = parseInt(durationMatch[1], 10);
+    const minutes = parseInt(durationMatch[2], 10);
+    const seconds = parseInt(durationMatch[3], 10);
+    
+    let totalMinutes = (hours * 60) + minutes + (seconds >= 30 ? 1 : 0);
+    
+    if (BREAK_STUDENT && folderName && folderName.toLowerCase().includes(BREAK_STUDENT.toLowerCase()) && totalMinutes > BREAK_THRESHOLD) {
+      Logger.log(`Break adjustment for ${BREAK_STUDENT}: ${totalMinutes} minutes before adjustment`);
+      totalMinutes -= BREAK_MINUTES;
+      Logger.log(`Applied ${BREAK_MINUTES}-minute break adjustment: ${totalMinutes} minutes`);
+    }
+    
+    sessionDuration = Math.round(totalMinutes / 15) * 15;
+    Logger.log(`Found duration in all content: ${hours}:${minutes}:${seconds} -> ${totalMinutes} minutes -> ${sessionDuration} minutes (rounded)`);
+    return sessionDuration;
+  }
+  
+  // Try alternative patterns
+  const timestampMatches = allContent.match(/\((\d{1,2}):(\d{2}):(\d{2})\)/g);
+  if (timestampMatches && timestampMatches.length > 0) {
+    const lastTimestamp = timestampMatches[timestampMatches.length - 1];
+    const timeComponents = lastTimestamp.match(/\((\d{1,2}):(\d{2}):(\d{2})\)/);
+    
+    if (timeComponents) {
+      const hours = parseInt(timeComponents[1], 10);
+      const minutes = parseInt(timeComponents[2], 10);
+      const seconds = parseInt(timeComponents[3], 10);
+      
+      let totalMinutes = (hours * 60) + minutes + (seconds >= 30 ? 1 : 0);
+      
+      if (BREAK_STUDENT && folderName && folderName.toLowerCase().includes(BREAK_STUDENT.toLowerCase()) && totalMinutes > BREAK_THRESHOLD) {
+        Logger.log(`Break adjustment for ${BREAK_STUDENT}: ${totalMinutes} minutes before adjustment`);
+        totalMinutes -= BREAK_MINUTES;
+        Logger.log(`Applied ${BREAK_MINUTES}-minute break adjustment: ${totalMinutes} minutes`);
+      }
+      
+      sessionDuration = Math.round(totalMinutes / 15) * 15;
+      Logger.log(`Found duration from timestamp: ${hours}:${minutes}:${seconds} -> ${totalMinutes} minutes -> ${sessionDuration} minutes (rounded)`);
+      return sessionDuration;
+    }
+  }
+  
+  Logger.log("No duration found");
+  return 0;
+}
+
+/**
+ * Helper function to extract verbal summary from transcript
+ * 
+ * This looks for an "in summary" phrase spoken by the instructor near
+ * the end of a session and extracts that as a verbal summary.
+ * Update the speaker/student names below to match your own.
+ */
+
+// Configure instructor and student names for verbal summary extraction
+const INSTRUCTOR_NAME = "Instructor";  // Replace with your name as it appears in transcripts
+const STUDENT_NAMES = ["Student"];      // Replace with student names as they appear in transcripts
+
+function extractVerbalSummary(transcriptContent, allContent) {
+  if (!transcriptContent && !allContent) {
+    return { verbalSummary: "", hasVerbalSummary: false };
+  }
+  
+  // Use transcript content if available, otherwise fall back to all content
+  const contentToSearch = transcriptContent || allContent;
+  
+  // Build regex pattern dynamically from configured names
+  const studentPattern = STUDENT_NAMES.join('|');
+  const summaryPattern = new RegExp(
+    `${INSTRUCTOR_NAME}:[^]*?(?:so in summary|in summary)([^]*?)(?:${studentPattern}|Transcription ended)`, 'i'
+  );
+  const match = contentToSearch.match(summaryPattern);
+  
+  if (match && match[1]) {
+    const summary = match[1].trim();
+    const wordCount = summary.split(/\s+/).filter(word => word.length > 0).length;
+    
+    if (wordCount <= 400) {
+      Logger.log(`Found verbal summary: ${wordCount} words - ${summary.substring(0, 100)}...`);
+      return { verbalSummary: summary, hasVerbalSummary: true };
+    } else {
+      Logger.log(`Rejected verbal summary: ${wordCount} words exceeds 400-word limit`);
+    }
+  }
+  
+  Logger.log("No verbal summary found with 'in summary' phrase");
+  return { verbalSummary: "", hasVerbalSummary: false };
+}
+
+/**
+ * Format a date object to "Month DD, YYYY" format
+ */
+function formatDateLong(year, month, day) {
+  const monthNames = ["January", "February", "March", "April", "May", "June", 
+                      "July", "August", "September", "October", "November", "December"];
+  const monthName = monthNames[month - 1];
+  const dayStr = day.toString().padStart(2, '0');
+  return `${monthName} ${dayStr}, ${year}`;
+}
+
+/**
+ * Format a date to "DD/MM/YYYY" format
+ */
+function formatDateShort(year, month, day) {
+  const dayStr = day.toString().padStart(2, '0');
+  const monthStr = month.toString().padStart(2, '0');
+  return `${dayStr}/${monthStr}/${year}`;
+}
+
+/**
+ * Process an individual session folder
+ */
+function processSessionFolder(folderInfo, monthStr, monthName, year, outputFolder, createdDocs) {
+  if (!folderInfo || !folderInfo.id) {
+    Logger.log('Error: Invalid folder information provided');
+    return;
+  }
+  
+  const folderId = folderInfo.id;
+  const folderName = folderInfo.name || 'Unknown Folder';
+  
+  const outputName = `${folderName} Sessions - ${monthName} ${year}`;
+  const outputDoc = DocumentApp.create(outputName);
+  const body = outputDoc.getBody();
+  
+  body.appendParagraph(outputName)
+      .setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const files = folder.getFilesByType(MimeType.GOOGLE_DOCS);
+    
+    const docInfoArray = [];
+    let totalSessionMinutes = 0;
+    
+    while (files.hasNext()) {
+      const file = files.next();
+      const docId = file.getId();
+      const docName = file.getName();
+      
+      if (docId === outputDoc.getId()) continue;
+      
+      if (docName.includes(monthStr) && docName.includes("Notes by Gemini")) {
+        try {
+          const dateMatch = docName.match(/(\d{4})\/(\d{2})\/(\d{2})/);
+          
+          if (dateMatch) {
+            const docYear = parseInt(dateMatch[1], 10);
+            const docMonth = parseInt(dateMatch[2], 10);
+            const docDay = parseInt(dateMatch[3], 10);
+            
+            const formattedDateLong = formatDateLong(docYear, docMonth, docDay);
+            const formattedDateShort = formatDateShort(docYear, docMonth, docDay);
+            const sortKey = `${docYear}-${docMonth.toString().padStart(2, '0')}-${docDay.toString().padStart(2, '0')}`;
+            
+            Logger.log(`Parsed date from filename: ${docName} -> Year: ${docYear}, Month: ${docMonth}, Day: ${docDay}`);
+            Logger.log(`Formatted dates: Long="${formattedDateLong}", Short="${formattedDateShort}", SortKey="${sortKey}"`);
+            
+            try {
+              const doc = Docs.Documents.get(docId, { includeTabsContent: true });
+              Logger.log(`Processing document: ${docName}`);
+              
+              const contentData = extractDocumentContent(doc);
+              
+              let sessionDuration = extractSessionDuration(contentData.allContent, contentData.transcriptContent, folderName);
+              totalSessionMinutes += sessionDuration;
+              
+              const verbalSummaryData = extractVerbalSummary(contentData.transcriptContent, contentData.allContent);
+              
+              let summaryText = contentData.summaryContent;
+              if (!summaryText || summaryText.trim() === "") {
+                summaryText = "No summary section found in this document.";
+              }
+              
+              let durationText = "Duration not found";
+              if (sessionDuration > 0) {
+                const durationHours = Math.floor(sessionDuration / 60);
+                const durationMinutes = sessionDuration % 60;
+                
+                if (durationHours > 0) {
+                  durationText = `${durationHours} hour${durationHours !== 1 ? 's' : ''}`;
+                  if (durationMinutes > 0) {
+                    durationText += ` ${durationMinutes} minute${durationMinutes !== 1 ? 's' : ''}`;
+                  }
+                } else {
+                  durationText = `${durationMinutes} minute${durationMinutes !== 1 ? 's' : ''}`;
+                }
+              }
+              
+              docInfoArray.push({
+                sortKey: sortKey,
+                formattedDateLong: formattedDateLong,
+                formattedDateShort: formattedDateShort,
+                name: docName,
+                url: file.getUrl(),
+                summary: summaryText,
+                verbalSummary: verbalSummaryData.verbalSummary,
+                hasVerbalSummary: verbalSummaryData.hasVerbalSummary,
+                duration: sessionDuration,
+                durationText: durationText
+              });
+              
+              Logger.log(`Processed ${docName}: Date=${formattedDateLong}, Duration=${durationText}, HasVerbalSummary=${verbalSummaryData.hasVerbalSummary}`);
+              
+            } catch (docApiError) {
+              Logger.log(`Error accessing document with Docs API: ${docName} - ${docApiError.toString()}`);
+              
+              docInfoArray.push({
+                sortKey: sortKey,
+                formattedDateLong: formattedDateLong,
+                formattedDateShort: formattedDateShort,
+                name: docName,
+                url: file.getUrl(),
+                summary: `Could not access document content. Error: ${docApiError.toString()}`,
+                verbalSummary: "",
+                hasVerbalSummary: false,
+                duration: 0,
+                durationText: "Unknown"
+              });
+            }
+          } else {
+            Logger.log(`Could not parse date from filename: ${docName}`);
+          }
+        } catch (error) {
+          Logger.log(`Error processing document ${docName}: ${error.toString()}`);
+        }
+      }
+    }
+    
+    if (docInfoArray.length === 0) {
+      body.appendParagraph(`No tutoring sessions found for ${monthName} ${year} in folder "${folderName}".`);
+      
+      const newFile = DriveApp.getFileById(outputDoc.getId());
+      outputFolder.addFile(newFile);
+      DriveApp.getRootFolder().removeFile(newFile);
+      
+      const url = outputDoc.getUrl();
+      Logger.log(`Empty summary document created for folder "${folderName}": ${url}`);
+      createdDocs.push({
+        folder: folderName,
+        url: url,
+        count: 0,
+        totalDuration: 0
+      });
+      return;
+    }
+    
+    docInfoArray.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+    
+    body.appendParagraph(`Summary for ${monthName} ${year}`)
+        .setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    
+    const totalHours = Math.floor(totalSessionMinutes / 60);
+    const totalMinutes = totalSessionMinutes % 60;
+    let totalDurationText = "";
+    
+    if (totalHours > 0) {
+      totalDurationText = `${totalHours} hour${totalHours !== 1 ? 's' : ''}`;
+      if (totalMinutes > 0) {
+        totalDurationText += ` ${totalMinutes} minute${totalMinutes !== 1 ? 's' : ''}`;
+      }
+    } else {
+      totalDurationText = `${totalMinutes} minute${totalMinutes !== 1 ? 's' : ''}`;
+    }
+    
+    body.appendParagraph(`Number of sessions: ${docInfoArray.length}`);
+    body.appendParagraph(`Total tutoring time: ${totalDurationText}`);
+    
+    body.appendParagraph("");
+    
+    body.appendParagraph("Individual Sessions")
+        .setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    
+    for (const doc of docInfoArray) {
+      body.appendParagraph(`Session on ${doc.formattedDateShort}`)
+          .setHeading(DocumentApp.ParagraphHeading.HEADING3);
+      
+      body.appendParagraph(`Duration: ${doc.durationText}`)
+          .setItalic(true);
+      
+      body.appendParagraph('View original document')
+          .setLinkUrl(doc.url);
+    }
+    
+    body.appendParagraph("");
+    
+    body.appendParagraph("Session Reports")
+        .setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    
+    for (const doc of docInfoArray) {
+      const reportText = `${doc.formattedDateLong}: ${doc.summary}`;
+      body.appendParagraph(reportText);
+      
+      if (doc.hasVerbalSummary && doc.verbalSummary) {
+        body.appendParagraph("Instructor's End-of-Session Summary:")
+            .setBold(true);
+        body.appendParagraph(doc.verbalSummary);
+      }
+    }
+    
+    const newFile = DriveApp.getFileById(outputDoc.getId());
+    outputFolder.addFile(newFile);
+    DriveApp.getRootFolder().removeFile(newFile);
+    
+    const url = outputDoc.getUrl();
+    Logger.log(`Summary document created for folder "${folderName}": ${url} with ${docInfoArray.length} sessions, total duration: ${totalDurationText}`);
+    createdDocs.push({
+      folder: folderName,
+      url: url,
+      count: docInfoArray.length,
+      totalDuration: totalSessionMinutes
+    });
+  } catch (error) {
+    Logger.log(`Error processing folder "${folderName}": ${error.toString()}`);
+    outputDoc.getBody().appendParagraph(`Error processing folder: ${error.toString()}`);
+    
+    try {
+      const newFile = DriveApp.getFileById(outputDoc.getId());
+      outputFolder.addFile(newFile);
+      DriveApp.getRootFolder().removeFile(newFile);
+    } catch (moveError) {
+      Logger.log(`Error moving error document: ${moveError.toString()}`);
+    }
+  }
+}
+
+/**
+ * Create a master summary document for all sessions
+ */
+function createMasterSummary(createdDocs, monthName, year, outputFolder) {
+  if (createdDocs.length === 0) {
+    Logger.log("No documents created, skipping master summary.");
+    return;
+  }
+  
+  const outputName = `Master Summary - ${monthName} ${year}`;
+  const outputDoc = DocumentApp.create(outputName);
+  const body = outputDoc.getBody();
+  
+  body.appendParagraph(outputName)
+      .setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  
+  body.appendParagraph(`This document summarizes all tutoring sessions for ${monthName} ${year}.`);
+  
+  let totalSessions = 0;
+  let totalMinutes = 0;
+  
+  for (const doc of createdDocs) {
+    totalSessions += doc.count;
+    totalMinutes += doc.totalDuration;
+  }
+  
+  const totalHours = Math.floor(totalMinutes / 60);
+  const remainingMinutes = totalMinutes % 60;
+  let totalDurationText = "";
+  
+  if (totalHours > 0) {
+    totalDurationText = `${totalHours} hour${totalHours !== 1 ? 's' : ''}`;
+    if (remainingMinutes > 0) {
+      totalDurationText += ` ${remainingMinutes} minute${remainingMinutes !== 1 ? 's' : ''}`;
+    }
+  } else {
+    totalDurationText = `${remainingMinutes} minute${remainingMinutes !== 1 ? 's' : ''}`;
+  }
+  
+  body.appendParagraph("");
+  
+  body.appendParagraph("Overall Totals")
+      .setHeading(DocumentApp.ParagraphHeading.HEADING2);
+  
+  body.appendParagraph(`Total number of sessions: ${totalSessions}`);
+  body.appendParagraph(`Total tutoring time: ${totalDurationText}`);
+  
+  body.appendParagraph("");
+  
+  body.appendParagraph("Summary by Student")
+      .setHeading(DocumentApp.ParagraphHeading.HEADING2);
+  
+  const table = body.appendTable();
+  
+  const headerRow = table.appendTableRow();
+  headerRow.appendTableCell("Student").setBackgroundColor("#eeeeee");
+  headerRow.appendTableCell("Sessions").setBackgroundColor("#eeeeee");
+  headerRow.appendTableCell("Total Time").setBackgroundColor("#eeeeee");
+  headerRow.appendTableCell("Summary Document").setBackgroundColor("#eeeeee");
+  
+  createdDocs.sort((a, b) => a.folder.localeCompare(b.folder));
+  
+  for (const doc of createdDocs) {
+    const row = table.appendTableRow();
+    
+    row.appendTableCell(doc.folder);
+    row.appendTableCell(doc.count.toString());
+    
+    let durationText = "0 minutes";
+    if (doc.totalDuration > 0) {
+      const hours = Math.floor(doc.totalDuration / 60);
+      const minutes = doc.totalDuration % 60;
+      
+      if (hours > 0) {
+        durationText = `${hours} hour${hours !== 1 ? 's' : ''}`;
+        if (minutes > 0) {
+          durationText += ` ${minutes} minute${minutes !== 1 ? 's' : ''}`;
+        }
+      } else {
+        durationText = `${minutes} minute${minutes !== 1 ? 's' : ''}`;
+      }
+    }
+    
+    row.appendTableCell(durationText);
+    
+    const linkCell = row.appendTableCell("View Summary");
+    linkCell.setLinkUrl(doc.url);
+  }
+  
+  const newFile = DriveApp.getFileById(outputDoc.getId());
+  outputFolder.addFile(newFile);
+  DriveApp.getRootFolder().removeFile(newFile);
+  
+  Logger.log(`Master summary document created: ${outputDoc.getUrl()} with ${totalSessions} total sessions across ${createdDocs.length} students.`);
+}
