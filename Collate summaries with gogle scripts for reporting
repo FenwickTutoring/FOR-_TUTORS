@@ -392,8 +392,7 @@ function extractSessionDuration(allContent, transcriptContent, folderName) {
 
 /**
  * Helper function to extract verbal summary from transcript
- * 
- * This looks for an "in summary" phrase spoken by the instructor near
+ * * This looks for the "report report report" phrase spoken by the instructor near
  * the end of a session and extracts that as a verbal summary.
  * Update the speaker/student names below to match your own.
  */
@@ -412,9 +411,12 @@ function extractVerbalSummary(transcriptContent, allContent) {
   
   // Build regex pattern dynamically from configured names
   const studentPattern = STUDENT_NAMES.join('|');
+  
+  // UPDATED: Now looks for "report report report" instead of "in summary"
   const summaryPattern = new RegExp(
-    `${INSTRUCTOR_NAME}:[^]*?(?:so in summary|in summary)([^]*?)(?:${studentPattern}|Transcription ended)`, 'i'
+    `${INSTRUCTOR_NAME}:[^]*?(?:report report report)([^]*?)(?:${studentPattern}|Transcription ended)`, 'i'
   );
+  
   const match = contentToSearch.match(summaryPattern);
   
   if (match && match[1]) {
@@ -429,7 +431,7 @@ function extractVerbalSummary(transcriptContent, allContent) {
     }
   }
   
-  Logger.log("No verbal summary found with 'in summary' phrase");
+  Logger.log("No verbal summary found with 'report report report' phrase");
   return { verbalSummary: "", hasVerbalSummary: false };
 }
 
