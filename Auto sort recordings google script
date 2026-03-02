@@ -1,0 +1,133 @@
+/**
+ * Automatically moves Google Meet recordings and transcripts to student-specific folders
+ * and shares those folders with the appropriate people.
+ * 
+ * Set this script to run on a time-based trigger (e.g., every hour)
+ */
+
+// List of student names to match in meeting titles
+const STUDENTS = [
+  'Student1', 'Student2', 'Student3', 
+  'Student4', 'Student5', 'Student6', 'Student7', 'Student8', 'Student9'
+];
+
+// Main function that processes new recordings
+function processNewRecordings() {
+  // Get the "Meet Recordings" folder where Google Meet automatically saves recordings
+  const meetRecordingsFolder = DriveApp.getFoldersByName('Meet Recordings');
+  
+  if (!meetRecordingsFolder.hasNext()) {
+    Logger.log('Meet Recordings folder not found');
+    return;
+  }
+  
+  const recordingsFolder = meetRecordingsFolder.next();
+  const tutoringSessionsFolder = findOrCreateFolder('My Drive', 'Tutoring Sessions');
+  
+  // Process all files in the Meet Recordings folder
+  const files = recordingsFolder.getFiles();
+  Logger.log(`Starting to process files in Meet Recordings folder`);
+  
+  while (files.hasNext()) {
+    const file = files.next();
+    const fileName = file.getName();
+    Logger.log(`Found file: "${fileName}"`);
+    
+    // Check if this is a recording or transcript/notes
+    const isRecording = fileName.includes('Recording');
+    const isTranscript = fileName.includes('Notes by Gemini');
+    
+    Logger.log(`File "${fileName}" - isRecording: ${isRecording}, isTranscript: ${isTranscript}`);
+    
+    if (!isRecording && !isTranscript) {
+      Logger.log(`Skipping file: ${fileName} - Not a recording or notes`);
+      continue;
+    }
+    
+    // Find which student this recording belongs to
+    const student = findStudentInFileName(fileName);
+    
+    if (student) {
+      const studentFolderName = student + " Sessions";
+      const studentFolder = findOrCreateFolder(tutoringSessionsFolder.getId(), studentFolderName);
+      
+      file.moveTo(studentFolder);
+      
+      Logger.log(`Moved ${isRecording ? 'recording' : 'transcript'} for ${student} to their folder`);
+    } else {
+      Logger.log(`Could not identify student for file: ${fileName}`);
+    }
+  }
+}
+
+// Find a student name in the file name
+function findStudentInFileName(fileName) {
+  Logger.log(`Processing file: ${fileName}`);
+  
+  // Parse the file name to handle both en dash (–) and regular hyphen (-)
+  const parts = fileName.split(/\s+[–-]\s+/);
+  
+  Logger.log(`Split parts: ${JSON.stringify(parts)}`);
+  
+  if (parts.length < 2) {
+    Logger.log(`File name doesn't match expected format: ${fileName}`);
+    return null;
+  }
+  
+  const nameCandidate = parts[0].trim();
+  Logger.log(`Name candidate: ${nameCandidate}`);
+  
+  for (const student of STUDENTS) {
+    if (nameCandidate.toLowerCase() === student.toLowerCase()) {
+      Logger.log(`Found matching student: ${student}`);
+      return student;
+    }
+  }
+  
+  Logger.log(`No matching student found for name: ${nameCandidate}`);
+  return null;
+}
+
+// Find or create a folder
+function findOrCreateFolder(parent, folderName) {
+  let parentFolder;
+  
+  if (typeof parent === 'string') {
+    try {
+      parentFolder = DriveApp.getFolderById(parent);
+    } catch (e) {
+      if (parent === 'My Drive') {
+        parentFolder = DriveApp.getRootFolder();
+      } else {
+        Logger.log(`Error getting parent folder: ${e.message}`);
+        return null;
+      }
+    }
+  } else {
+    parentFolder = parent;
+  }
+  
+  const folderIterator = parentFolder.getFoldersByName(folderName);
+  if (folderIterator.hasNext()) {
+    return folderIterator.next();
+  }
+  
+  return parentFolder.createFolder(folderName);
+}
+
+// Set up a trigger to run this function automatically
+function createTimeTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const trigger of triggers) {
+    if (trigger.getHandlerFunction() === 'processNewRecordings') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  }
+  
+  ScriptApp.newTrigger('processNewRecordings')
+    .timeBased()
+    .everyHours(1)
+    .create();
+  
+  Logger.log('Trigger created to run processNewRecordings every hour');
+}
